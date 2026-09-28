@@ -435,6 +435,8 @@ pub enum ContractError {
     UpgradeManifestNotSet = 130,
     // Issue #547: AML screening rejected a beneficiary / transfer recipient
     AmlFlaggedAddress = 131,
+    UpgradeFunctionSignaturesChanged = 132,
+    UpgradeFunctionSignaturesNotSet = 133,
 }
 
 #[contract]
@@ -939,6 +941,7 @@ impl TtlVaultContract {
         env: Env,
         exported_fn_count: u32,
         error_code_count: u32,
+        exported_fn_signature_hash: BytesN<32>,
         storage_schema_hash: BytesN<32>,
     ) {
         Self::require_admin(&env);
@@ -959,6 +962,9 @@ impl TtlVaultContract {
         env.storage()
             .instance()
             .set(&DataKey::UpgradeManifest, &manifest);
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeFunctionSignatureHash, &exported_fn_signature_hash);
     }
 
     /// Returns the currently recorded upgrade manifest, if any.
@@ -973,12 +979,15 @@ impl TtlVaultContract {
     /// Checks (see `docs/upgrade-safety.md` for rationale and how callers
     /// are expected to compute the new-contract values off-chain before
     /// submitting the upgrade transaction):
-    /// - Same exported function count (interface not shrunk)
+    /// - Same exported function signature hash (no function is removed or changed)
+    /// - Same or greater exported function count (interface not shrunk)
     /// - Same or greater error code count (error codes not removed/renumbered)
     /// - Same storage schema hash (no storage keys dropped or repurposed)
     ///
     /// # Errors
     /// - `UpgradeManifestNotSet` if no baseline has been recorded yet
+    /// - `UpgradeFunctionSignaturesNotSet` if no signature baseline has been recorded yet
+    /// - `UpgradeFunctionSignaturesChanged` if an exported signature changes
     /// - `UpgradeInterfaceShrunk` if the new contract exports fewer functions
     /// - `UpgradeErrorCodesReduced` if the new contract has fewer error codes
     /// - `UpgradeStorageSchemaChanged` if the storage schema hash differs
@@ -986,6 +995,7 @@ impl TtlVaultContract {
         env: Env,
         new_exported_fn_count: u32,
         new_error_code_count: u32,
+        new_exported_fn_signature_hash: BytesN<32>,
         new_storage_schema_hash: BytesN<32>,
     ) {
         let manifest: UpgradeManifest = env
@@ -993,9 +1003,19 @@ impl TtlVaultContract {
             .instance()
             .get(&DataKey::UpgradeManifest)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::UpgradeManifestNotSet));
+        let signature_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeFunctionSignatureHash)
+            .unwrap_or_else(|| {
+                panic_with_error!(&env, ContractError::UpgradeFunctionSignaturesNotSet)
+            });
 
         if new_exported_fn_count < manifest.exported_fn_count {
             panic_with_error!(&env, ContractError::UpgradeInterfaceShrunk);
+        }
+        if new_exported_fn_signature_hash != signature_hash {
+            panic_with_error!(&env, ContractError::UpgradeFunctionSignaturesChanged);
         }
         if new_error_code_count < manifest.error_code_count {
             panic_with_error!(&env, ContractError::UpgradeErrorCodesReduced);
@@ -1031,6 +1051,7 @@ impl TtlVaultContract {
         new_wasm_hash: BytesN<32>,
         new_exported_fn_count: u32,
         new_error_code_count: u32,
+        new_exported_fn_signature_hash: BytesN<32>,
         new_storage_schema_hash: BytesN<32>,
     ) {
         Self::require_admin(&env);
@@ -1039,6 +1060,7 @@ impl TtlVaultContract {
             env.clone(),
             new_exported_fn_count,
             new_error_code_count,
+            new_exported_fn_signature_hash.clone(),
             new_storage_schema_hash.clone(),
         );
 
@@ -1051,6 +1073,7 @@ impl TtlVaultContract {
             env,
             new_exported_fn_count,
             new_error_code_count,
+            new_exported_fn_signature_hash,
             new_storage_schema_hash,
         );
     }
