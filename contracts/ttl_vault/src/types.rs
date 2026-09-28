@@ -575,6 +575,8 @@ pub enum DataKey {
     MerkleLeafCount(u64),
     /// vault_id → current Merkle root (BytesN<32>)
     MerkleRoot(u64),
+    /// Hash of the sorted exported function signatures for the upgrade baseline.
+    UpgradeFunctionSignatureHash,
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -1595,8 +1597,10 @@ pub struct PauseRecord {
 /// to declare the new contract's fingerprint out-of-band (e.g. computed by
 /// a build-time tool that inspects the new WASM's export table and error
 /// enum) and compares it against the fingerprint recorded for the running
-/// contract, so an upgrade cannot silently shrink the interface, drop
-/// storage keys, or renumber error codes. See docs/upgrade-safety.md.
+/// contract, so an upgrade cannot silently change function signatures, shrink
+/// the interface, drop storage keys, or renumber error codes. The signature
+/// hash is stored separately to keep this contract type compatible with
+/// manifests recorded by earlier deployments. See docs/upgrade-safety.md.
 #[contracttype]
 #[derive(Clone)]
 pub struct UpgradeManifest {

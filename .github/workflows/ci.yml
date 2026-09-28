@@ -52,6 +52,11 @@ jobs:
       - name: Build crate
         run: cargo build --package ttl-vault --lib
 
+      # The local Soroban upgrade tests load this compiled WASM and exercise
+      # update_current_contract_wasm against a live TestEnv contract instance.
+      - name: Build upgrade test WASM
+        run: cargo build --package ttl-vault --target wasm32-unknown-unknown --release
+
       # ── Required check (Issue #424) ─────────────────────────────────────────
       # Runs ALL #[cfg(test)] modules, which includes:
       #   • regression_tests.rs   (general regression suite)
@@ -140,20 +145,13 @@ jobs:
           echo "✅ Committed docs match the generator output."
 
       # ── Required check (Issue #425) ─────────────────────────────────────────
-      # Builds the contract as WASM and enforces the size budgets defined in
-      # docs/wasm-size-budget.md.
+      # Enforces the size budget for the WASM artifact built before the tests.
       #
       # Thresholds (must be kept in sync with docs/wasm-size-budget.md):
       #   ttl_vault  warning: 460 KB  hard limit: 512 KB
       #
       # The step fails the build when any contract exceeds its hard limit, and
       # prints a warning when it exceeds the warning threshold.
-      - name: Build WASM artifact
-        id: wasm-build
-        run: |
-          cargo build --package ttl-vault --target wasm32-unknown-unknown --release
-          echo "Built WASM artifact"
-
       - name: Check WASM size budget
         id: wasm-size-check
         run: |
