@@ -10,7 +10,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::db::Db;
@@ -79,9 +79,9 @@ impl StoredEvent {
 
     /// Migrate the event's data payload to the current schema version.
     /// Add new `match` arms here when `CURRENT_SCHEMA_VERSION` is bumped.
-    pub fn migrate_to_current(mut self) -> Self {
+    pub fn migrate_to_current(mut self) -> Result<Self, EventSourcingError> {
         if self.schema_version == CURRENT_SCHEMA_VERSION {
-            return self;
+            return Ok(self);
         }
         // Example migration: v0 → v1 renamed "amount" to "balance_delta"
         if self.schema_version == 0 {
@@ -92,7 +92,13 @@ impl StoredEvent {
             }
             self.schema_version = 1;
         }
-        self
+        if self.schema_version != CURRENT_SCHEMA_VERSION {
+            return Err(EventSourcingError::InvalidHistory(format!(
+                "unsupported event schema version {} at sequence {}",
+                self.schema_version, self.sequence
+            )));
+        }
+        Ok(self)
     }
 }
 
@@ -143,16 +149,24 @@ impl EventLog {
     ) -> Result<u64, EventSourcingError> {
         let vault_id = vault_id.into();
 
-        let seq = {
-            let mut seqs = self
-                .sequences
-                .lock()
-                .map_err(|_| EventSourcingError::LockPoisoned)?;
-            let next = seqs.entry(vault_id.clone()).or_insert(1);
-            let assigned = *next;
-            *next += 1;
-            assigned
+        let mut seqs = self
+            .sequences
+            .lock()
+            .map_err(|_| EventSourcingError::LockPoisoned)?;
+        let next = seqs.entry(vault_id.clone()).or_insert(1);
+        let seq = if let Some(db) = &self.db {
+            db.get_last_event_sequence(&vault_id)
+                .map_err(|e| EventSourcingError::DatabaseError(e.to_string()))?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    EventSourcingError::InvalidHistory("event sequence exhausted".into())
+                })?
+        } else {
+            *next
         };
+        let following_sequence = seq
+            .checked_add(1)
+            .ok_or_else(|| EventSourcingError::InvalidHistory("event sequence exhausted".into()))?;
 
         let event = StoredEvent::new(vault_id.clone(), seq, event_type, data);
 
@@ -171,6 +185,7 @@ impl EventLog {
             .map_err(|e| EventSourcingError::DatabaseError(e.to_string()))?;
         }
 
+        *next = following_sequence;
         self.events
             .lock()
             .map_err(|_| EventSourcingError::LockPoisoned)?
@@ -305,7 +320,7 @@ impl SnapshotState {
 /// Snapshots can be persisted to SQLite via an optional Db connection.
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotStore {
-    snapshots: Arc<Mutex<HashMap<String, VaultSnapshot>>>,
+    snapshots: Arc<Mutex<HashMap<String, BTreeMap<u64, VaultSnapshot>>>>,
     /// Optional database connection for durable persistence.
     db: Option<Arc<Db>>,
 }
@@ -341,7 +356,9 @@ impl SnapshotStore {
         self.snapshots
             .lock()
             .map_err(|_| EventSourcingError::LockPoisoned)?
-            .insert(snapshot.vault_id.clone(), snapshot);
+            .entry(snapshot.vault_id.clone())
+            .or_default()
+            .insert(snapshot.snapshot_sequence, snapshot);
         Ok(())
     }
 
@@ -382,7 +399,49 @@ impl SnapshotStore {
             .lock()
             .map_err(|_| EventSourcingError::LockPoisoned)?
             .get(vault_id)
-            .cloned())
+            .and_then(|history| {
+                history
+                    .last_key_value()
+                    .map(|(_, snapshot)| snapshot.clone())
+            }))
+    }
+
+    /// Retrieve the newest snapshot at or before `sequence`.
+    pub fn get_at_or_before(
+        &self,
+        vault_id: &str,
+        sequence: u64,
+    ) -> Result<Option<VaultSnapshot>, EventSourcingError> {
+        if let Some(db) = &self.db {
+            if let Some((snapshot_sequence, taken_at_str, state_str)) = db
+                .get_snapshot_at_or_before(vault_id, sequence)
+                .map_err(|e| EventSourcingError::DatabaseError(e.to_string()))?
+            {
+                let taken_at = DateTime::parse_from_rfc3339(&taken_at_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| EventSourcingError::DatabaseError(e.to_string()))?;
+                let state = serde_json::from_str(&state_str)?;
+                return Ok(Some(VaultSnapshot {
+                    vault_id: vault_id.to_string(),
+                    snapshot_sequence,
+                    taken_at,
+                    state,
+                }));
+            }
+            return Ok(None);
+        }
+
+        Ok(self
+            .snapshots
+            .lock()
+            .map_err(|_| EventSourcingError::LockPoisoned)?
+            .get(vault_id)
+            .and_then(|history| {
+                history
+                    .range(..=sequence)
+                    .next_back()
+                    .map(|(_, snapshot)| snapshot.clone())
+            }))
     }
 
     /// Create a snapshot from the current vault state and the sequence number
@@ -428,37 +487,22 @@ impl<'a> EventReplayer<'a> {
     ///  2. Fetch events with sequence > snapshot_sequence.
     ///  3. Apply each event in order.
     pub fn replay(&self, vault_id: &str) -> Result<ReplayedState, EventSourcingError> {
-        // Step 1 — baseline state
-        let (mut state, start_seq) = match self.snapshots.get(vault_id)? {
-            Some(snap) => (snap.state, snap.snapshot_sequence),
-            None => (
-                SnapshotState {
-                    balance: 0,
-                    status: VaultStatus::Active,
-                    last_check_in: Utc::now(),
-                    ttl_remaining: None,
-                },
-                0,
-            ),
-        };
-
-        // Step 2 — events after snapshot
-        let events = self.log.events_after(vault_id, start_seq)?;
-        let event_count = events.len();
-        let last_sequence = events.last().map(|e| e.sequence).unwrap_or(start_seq);
-
-        // Step 3 — apply
-        for raw in events {
-            let event = raw.migrate_to_current();
-            apply_event(&mut state, &event);
+        let events = self.log.events_for_vault(vault_id)?;
+        let head = events.last().map(|event| event.sequence).unwrap_or(0);
+        let snapshot = self.snapshots.get(vault_id)?;
+        let start_sequence = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.snapshot_sequence)
+            .unwrap_or(0);
+        if start_sequence > head {
+            return Err(EventSourcingError::InvalidHistory(format!(
+                "snapshot sequence {start_sequence} is beyond the event head {head}"
+            )));
         }
-
-        Ok(ReplayedState {
-            vault_id: vault_id.to_string(),
-            state,
-            last_sequence,
-            events_applied: event_count,
-        })
+        let state = snapshot
+            .map(|snapshot| snapshot.state)
+            .unwrap_or_else(genesis_state);
+        replay_events(vault_id, state, start_sequence, head, events)
     }
 
     /// Like [`replay`](Self::replay), but also persists a fresh snapshot when at
@@ -501,42 +545,80 @@ impl<'a> EventReplayer<'a> {
         vault_id: &str,
         target_sequence: u64,
     ) -> Result<ReplayedState, EventSourcingError> {
-        let (mut state, start_seq) = match self.snapshots.get(vault_id)? {
-            Some(snap) if snap.snapshot_sequence <= target_sequence => {
-                (snap.state, snap.snapshot_sequence)
-            }
-            _ => (
-                SnapshotState {
-                    balance: 0,
-                    status: VaultStatus::Active,
-                    last_check_in: Utc::now(),
-                    ttl_remaining: None,
-                },
-                0,
-            ),
-        };
-
-        let events = self.log.events_after(vault_id, start_seq)?;
-        let filtered: Vec<StoredEvent> = events
-            .into_iter()
-            .filter(|e| e.sequence <= target_sequence)
-            .collect();
-
-        let event_count = filtered.len();
-        let last_sequence = filtered.last().map(|e| e.sequence).unwrap_or(start_seq);
-
-        for raw in filtered {
-            let event = raw.migrate_to_current();
-            apply_event(&mut state, &event);
+        let events = self.log.events_for_vault(vault_id)?;
+        let head = events.last().map(|event| event.sequence).unwrap_or(0);
+        if target_sequence > head {
+            return Err(EventSourcingError::SequenceOutOfRange {
+                requested: target_sequence,
+                latest: head,
+            });
         }
-
-        Ok(ReplayedState {
-            vault_id: vault_id.to_string(),
-            state,
-            last_sequence,
-            events_applied: event_count,
-        })
+        let snapshot = self.snapshots.get_at_or_before(vault_id, target_sequence)?;
+        let start_sequence = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.snapshot_sequence)
+            .unwrap_or(0);
+        let state = snapshot
+            .map(|snapshot| snapshot.state)
+            .unwrap_or_else(genesis_state);
+        replay_events(vault_id, state, start_sequence, target_sequence, events)
     }
+}
+
+fn genesis_state() -> SnapshotState {
+    SnapshotState {
+        balance: 0,
+        status: VaultStatus::Active,
+        last_check_in: DateTime::<Utc>::from_timestamp(0, 0)
+            .expect("Unix epoch is a valid timestamp"),
+        ttl_remaining: None,
+    }
+}
+
+fn replay_events(
+    vault_id: &str,
+    mut state: SnapshotState,
+    start_sequence: u64,
+    target_sequence: u64,
+    events: Vec<StoredEvent>,
+) -> Result<ReplayedState, EventSourcingError> {
+    let mut expected_sequence = start_sequence.saturating_add(1);
+    let mut events_applied = 0;
+    let mut last_sequence = start_sequence;
+
+    for raw in events
+        .into_iter()
+        .filter(|event| event.sequence > start_sequence)
+    {
+        if expected_sequence > target_sequence {
+            break;
+        }
+        if raw.sequence != expected_sequence {
+            return Err(EventSourcingError::HistoryGap {
+                expected: expected_sequence,
+                found: raw.sequence,
+            });
+        }
+        let event = raw.migrate_to_current()?;
+        apply_event(&mut state, &event)?;
+        events_applied += 1;
+        last_sequence = event.sequence;
+        expected_sequence = expected_sequence.saturating_add(1);
+    }
+
+    if last_sequence != target_sequence {
+        return Err(EventSourcingError::HistoryGap {
+            expected: target_sequence,
+            found: last_sequence,
+        });
+    }
+
+    Ok(ReplayedState {
+        vault_id: vault_id.to_string(),
+        state,
+        last_sequence,
+        events_applied,
+    })
 }
 
 /// Result returned by the replayer.
@@ -554,45 +636,80 @@ pub struct ReplayedState {
 
 /// Apply a single event to a mutable state.  Keep this pure so it is easy to
 /// test in isolation.
-fn apply_event(state: &mut SnapshotState, event: &StoredEvent) {
+fn apply_event(state: &mut SnapshotState, event: &StoredEvent) -> Result<(), EventSourcingError> {
     match &event.event_type {
         EventType::Deposit => {
-            if let Some(delta) = event.data.get("balance_delta").and_then(|v| v.as_i64()) {
-                state.balance += delta as i128;
-            }
+            let delta = required_i64(event, "balance_delta")? as i128;
+            state.balance = state.balance.checked_add(delta).ok_or_else(|| {
+                EventSourcingError::InvalidHistory(format!(
+                    "balance overflow at sequence {}",
+                    event.sequence
+                ))
+            })?;
         }
         EventType::Withdrawal => {
-            if let Some(delta) = event.data.get("balance_delta").and_then(|v| v.as_i64()) {
-                state.balance -= delta as i128;
-            }
+            let delta = required_i64(event, "balance_delta")? as i128;
+            state.balance = state.balance.checked_sub(delta).ok_or_else(|| {
+                EventSourcingError::InvalidHistory(format!(
+                    "balance overflow at sequence {}",
+                    event.sequence
+                ))
+            })?;
         }
         EventType::CheckIn => {
             state.last_check_in = event.timestamp;
-            if let Some(ttl) = event.data.get("ttl_remaining").and_then(|v| v.as_u64()) {
-                state.ttl_remaining = Some(ttl);
+            if let Some(ttl) = event.data.get("ttl_remaining") {
+                state.ttl_remaining = Some(ttl.as_u64().ok_or_else(|| {
+                    invalid_payload(event, "ttl_remaining must be a non-negative integer")
+                })?);
             }
         }
         EventType::TtlUpdate => {
-            if let Some(ttl) = event.data.get("ttl_remaining").and_then(|v| v.as_u64()) {
-                state.ttl_remaining = Some(ttl);
-            }
+            state.ttl_remaining = Some(required_u64(event, "ttl_remaining")?);
         }
         EventType::StatusChange => {
-            if let Some(s) = event.data.get("status").and_then(|v| v.as_str()) {
-                state.status = match s {
-                    "active" => VaultStatus::Active,
-                    "expired" => VaultStatus::Expired,
-                    "released" => VaultStatus::Released,
-                    "paused" => VaultStatus::Paused,
-                    _ => state.status.clone(),
-                };
-            }
+            let status = event
+                .data
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| invalid_payload(event, "status must be a string"))?;
+            state.status = match status {
+                "active" => VaultStatus::Active,
+                "expired" => VaultStatus::Expired,
+                "released" => VaultStatus::Released,
+                "paused" => VaultStatus::Paused,
+                _ => return Err(invalid_payload(event, "status is not recognized")),
+            };
         }
         EventType::Release => {
             state.status = VaultStatus::Released;
             state.balance = 0;
         }
     }
+    Ok(())
+}
+
+fn required_i64(event: &StoredEvent, field: &str) -> Result<i64, EventSourcingError> {
+    event
+        .data
+        .get(field)
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| invalid_payload(event, &format!("{field} must be an integer")))
+}
+
+fn required_u64(event: &StoredEvent, field: &str) -> Result<u64, EventSourcingError> {
+    event
+        .data
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| invalid_payload(event, &format!("{field} must be a non-negative integer")))
+}
+
+fn invalid_payload(event: &StoredEvent, reason: &str) -> EventSourcingError {
+    EventSourcingError::InvalidHistory(format!(
+        "invalid {:?} payload at sequence {}: {reason}",
+        event.event_type, event.sequence
+    ))
 }
 
 // ── Shared state wrapper ──────────────────────────────────────────────────────
@@ -642,6 +759,12 @@ pub enum EventSourcingError {
     Serialization(#[from] serde_json::Error),
     #[error("database error: {0}")]
     DatabaseError(String),
+    #[error("event history gap: expected sequence {expected}, found {found}")]
+    HistoryGap { expected: u64, found: u64 },
+    #[error("requested sequence {requested} is beyond the latest sequence {latest}")]
+    SequenceOutOfRange { requested: u64, latest: u64 },
+    #[error("invalid event history: {0}")]
+    InvalidHistory(String),
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -730,6 +853,132 @@ mod tests {
     }
 
     #[test]
+    fn replay_to_sequence_has_inclusive_boundaries_and_rejects_future_targets() {
+        let log = make_log_with_events();
+        let replayer = EventReplayer::new(&log, &SnapshotStore::new());
+
+        let genesis = replayer.replay_to("vault-1", 0).unwrap();
+        assert_eq!(genesis.last_sequence, 0);
+        assert_eq!(genesis.state.balance, 0);
+        assert_eq!(genesis.state.last_check_in.timestamp(), 0);
+
+        let latest = replayer.replay_to("vault-1", 3).unwrap();
+        assert_eq!(latest.last_sequence, 3);
+        assert_eq!(latest.state.balance, 800);
+        assert!(matches!(
+            replayer.replay_to("vault-1", 4),
+            Err(EventSourcingError::SequenceOutOfRange {
+                requested: 4,
+                latest: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn replay_uses_the_nearest_snapshot_before_the_requested_sequence() {
+        let log = make_log_with_events();
+        log.append(
+            "vault-1",
+            EventType::Deposit,
+            serde_json::json!({"balance_delta": 50}),
+        )
+        .unwrap();
+        let snapshots = SnapshotStore::new();
+        let replayer = EventReplayer::new(&log, &snapshots);
+        let at_two = replayer.replay_to("vault-1", 2).unwrap();
+        snapshots
+            .save(VaultSnapshot {
+                vault_id: "vault-1".into(),
+                snapshot_sequence: 2,
+                taken_at: Utc::now(),
+                state: at_two.state,
+            })
+            .unwrap();
+        let at_four = replayer.replay_to("vault-1", 4).unwrap();
+        snapshots
+            .save(VaultSnapshot {
+                vault_id: "vault-1".into(),
+                snapshot_sequence: 4,
+                taken_at: Utc::now(),
+                state: at_four.state,
+            })
+            .unwrap();
+
+        let historical = replayer.replay_to("vault-1", 3).unwrap();
+        assert_eq!(historical.last_sequence, 3);
+        assert_eq!(historical.state.balance, 800);
+        assert_eq!(historical.events_applied, 1);
+        assert_eq!(replayer.replay("vault-1").unwrap().state.balance, 850);
+    }
+
+    #[test]
+    fn replay_rejects_missing_sequences_and_corrupt_events() {
+        let log = EventLog::new();
+        log.append(
+            "vault-1",
+            EventType::Deposit,
+            serde_json::json!({"balance_delta": 100}),
+        )
+        .unwrap();
+        log.append(
+            "vault-1",
+            EventType::Withdrawal,
+            serde_json::json!({"balance_delta": 10}),
+        )
+        .unwrap();
+        log.events.lock().unwrap()[1].sequence = 3;
+        let replayer = EventReplayer::new(&log, &SnapshotStore::new());
+        assert!(matches!(
+            replayer.replay("vault-1"),
+            Err(EventSourcingError::HistoryGap {
+                expected: 2,
+                found: 3
+            })
+        ));
+
+        let corrupt_log = EventLog::new();
+        corrupt_log
+            .append("vault-1", EventType::Deposit, serde_json::json!({}))
+            .unwrap();
+        assert!(matches!(
+            EventReplayer::new(&corrupt_log, &SnapshotStore::new()).replay("vault-1"),
+            Err(EventSourcingError::InvalidHistory(_))
+        ));
+    }
+
+    #[test]
+    fn replay_rejects_snapshots_beyond_the_event_head_and_unknown_schemas() {
+        let log = make_log_with_events();
+        let snapshots = SnapshotStore::new();
+        snapshots
+            .save(VaultSnapshot {
+                vault_id: "vault-1".into(),
+                snapshot_sequence: 4,
+                taken_at: Utc::now(),
+                state: genesis_state(),
+            })
+            .unwrap();
+        assert!(matches!(
+            EventReplayer::new(&log, &snapshots).replay("vault-1"),
+            Err(EventSourcingError::InvalidHistory(_))
+        ));
+
+        let schema_log = EventLog::new();
+        schema_log
+            .append(
+                "vault-1",
+                EventType::Deposit,
+                serde_json::json!({"balance_delta": 1}),
+            )
+            .unwrap();
+        schema_log.events.lock().unwrap()[0].schema_version = CURRENT_SCHEMA_VERSION + 1;
+        assert!(matches!(
+            EventReplayer::new(&schema_log, &SnapshotStore::new()).replay("vault-1"),
+            Err(EventSourcingError::InvalidHistory(_))
+        ));
+    }
+
+    #[test]
     fn replay_to_target_sequence_stops_at_correct_point() {
         let log = make_log_with_events();
         let snapshots = SnapshotStore::new();
@@ -750,7 +999,7 @@ mod tests {
             data: serde_json::json!({"amount": 500}),
             schema_version: 0,
         };
-        event = event.migrate_to_current();
+        event = event.migrate_to_current().unwrap();
         assert_eq!(event.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(event.data.get("balance_delta").is_some());
         assert!(event.data.get("amount").is_none());
@@ -820,6 +1069,16 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, EventType::Deposit);
         assert_eq!(events[1].event_type, EventType::CheckIn);
+        assert_eq!(
+            new_log
+                .append(
+                    "vault-1",
+                    EventType::Deposit,
+                    serde_json::json!({"balance_delta": 1})
+                )
+                .unwrap(),
+            3
+        );
     }
 
     #[test]
@@ -854,6 +1113,45 @@ mod tests {
         let snap = retrieved.unwrap();
         assert_eq!(snap.snapshot_sequence, 100);
         assert_eq!(snap.state.balance, 5000);
+    }
+
+    #[test]
+    fn historical_snapshots_persist_and_are_selectable_by_sequence() {
+        let db = Arc::new(
+            crate::db::Db::open_with_pool_config(":memory:", &crate::db::PoolConfig::default())
+                .expect("failed to open db"),
+        );
+        db.migrate().expect("migration failed");
+
+        let snapshots = SnapshotStore::with_db(Arc::clone(&db));
+        for (sequence, balance) in [(2, 20), (4, 40)] {
+            snapshots
+                .save(VaultSnapshot {
+                    vault_id: "vault-1".into(),
+                    snapshot_sequence: sequence,
+                    taken_at: Utc::now(),
+                    state: SnapshotState {
+                        balance,
+                        status: VaultStatus::Active,
+                        last_check_in: Utc::now(),
+                        ttl_remaining: None,
+                    },
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            snapshots
+                .get_at_or_before("vault-1", 3)
+                .unwrap()
+                .unwrap()
+                .snapshot_sequence,
+            2
+        );
+        assert_eq!(
+            snapshots.get("vault-1").unwrap().unwrap().snapshot_sequence,
+            4
+        );
     }
 
     /// Append `n` alternating deposit/withdrawal events (net +800 per full
@@ -955,9 +1253,7 @@ mod tests {
         // Warm: take a snapshot once, then replay only the tail.
         let warm_snaps = SnapshotStore::new();
         let warm_replayer = EventReplayer::new(&log, &warm_snaps);
-        warm_replayer
-            .replay_with_snapshotting("vault-1")
-            .unwrap();
+        warm_replayer.replay_with_snapshotting("vault-1").unwrap();
         let warm_start = Instant::now();
         let mut warm_applied = 0usize;
         for _ in 0..20 {

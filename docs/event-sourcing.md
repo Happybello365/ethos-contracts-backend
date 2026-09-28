@@ -41,18 +41,20 @@ if self.schema_version == 0 {
 }
 ```
 
-### Snapshots (`SnapshotStore`)
+### Historical snapshots (`SnapshotStore`)
 
 Replaying from the very beginning of a long-lived vault becomes expensive. Snapshots
 bound the replay window.
 
-- A snapshot captures the vault's materialized state (balance, status, TTL, last
-  check-in) at a specific `snapshot_sequence`.
-- Replay loads the snapshot, then only applies events with `sequence > snapshot_sequence`.
+- Each snapshot captures materialized state (balance, status, TTL, last check-in)
+  at an exact `snapshot_sequence`. Snapshots at different sequences are retained;
+  saving a later snapshot does not discard earlier checkpoints.
+- A point-in-time replay uses the newest snapshot at or before its requested
+  sequence, then applies events through that sequence inclusively.
 - Snapshots are stored in `SnapshotStore` and persisted to SQLite (durable) via `Db`.
 
 ```rust
-// Take a snapshot after processing the 100th event
+// Take a snapshot after processing the 100th event; earlier snapshots remain queryable.
 snapshot_store.take_snapshot(&vault, last_sequence)?;
 ```
 
@@ -76,6 +78,15 @@ println!("balance = {}", state.state.balance);
 // Point-in-time audit: rebuild state up to sequence 50
 let historical = replayer.replay_to("vault-abc", 50)?;
 ```
+
+The history coordinate is the per-vault, 1-based event sequence (the event-ledger
+boundary), not a wall-clock timestamp or an external blockchain block number.
+Sequence `0` means the deterministic initial state; positive targets are inclusive
+and must exist in the available event history. A target beyond the current head,
+a missing sequence, an unsupported event schema, or an invalid event payload
+returns an error rather than a partial or guessed state. A snapshot is a trusted
+checkpoint: events before its sequence may have been pruned, while every replayed
+event after it must be contiguous.
 
 `ReplayedState` returns:
 
@@ -108,7 +119,8 @@ As of #267, events and snapshots are persisted to SQLite durably:
   `schema_version`.
 - **Snapshots table**: Snapshots are written to the `snapshots` table (via UPSERT) when
   `save()` is called. Each row stores: `vault_id`, `snapshot_sequence`, `taken_at`,
-  `state` (JSON).
+  `state` (JSON); the `(vault_id, snapshot_sequence)` key retains multiple historical
+  checkpoints.
 - **In-memory cache**: The in-memory Vec and HashMap are still maintained for quick replay
   within the same process, but the database is the authoritative source of truth.
 - **Bounded retention**: Events and snapshots can be archived or pruned via

@@ -1216,6 +1216,28 @@ impl Db {
                     ON vaults(owner, created_at);
                 ",
             ),
+            (
+                "20",
+                r"
+                -- #395: Retain snapshots at multiple event sequence
+                -- boundaries so historical queries can resume from the closest
+                -- snapshot that does not lie beyond the requested boundary.
+                ALTER TABLE snapshots RENAME TO snapshots_v19;
+                CREATE TABLE snapshots (
+                    vault_id          TEXT NOT NULL,
+                    snapshot_sequence INTEGER NOT NULL,
+                    taken_at          TEXT NOT NULL,
+                    state             TEXT NOT NULL,
+                    PRIMARY KEY (vault_id, snapshot_sequence)
+                );
+                INSERT INTO snapshots (vault_id, snapshot_sequence, taken_at, state)
+                    SELECT vault_id, snapshot_sequence, taken_at, state
+                    FROM snapshots_v19;
+                DROP TABLE snapshots_v19;
+                CREATE INDEX idx_snapshots_vault_sequence
+                    ON snapshots(vault_id, snapshot_sequence DESC);
+                ",
+            ),
         ];
 
         for (version, sql) in MIGRATIONS {
@@ -1263,7 +1285,10 @@ impl Db {
                 DROP TABLE IF EXISTS reminder_preferences;
                 ",
             ),
-            ("2", "ALTER TABLE reminder_preferences DROP COLUMN deleted_at;"),
+            (
+                "2",
+                "ALTER TABLE reminder_preferences DROP COLUMN deleted_at;",
+            ),
             (
                 "3",
                 r"
@@ -1333,6 +1358,30 @@ impl Db {
                 DROP INDEX IF EXISTS idx_vaults_owner_status;
                 DROP INDEX IF EXISTS idx_vaults_status;
                 DROP INDEX IF EXISTS idx_vaults_owner;
+                ",
+            ),
+            (
+                "20",
+                r"
+                DROP INDEX IF EXISTS idx_snapshots_vault_sequence;
+                CREATE TABLE snapshots_v19 (
+                    vault_id          TEXT PRIMARY KEY,
+                    snapshot_sequence INTEGER NOT NULL,
+                    taken_at          TEXT NOT NULL,
+                    state             TEXT NOT NULL
+                );
+                INSERT INTO snapshots_v19 (vault_id, snapshot_sequence, taken_at, state)
+                    SELECT s.vault_id, s.snapshot_sequence, s.taken_at, s.state
+                    FROM snapshots AS s
+                    JOIN (
+                        SELECT vault_id, MAX(snapshot_sequence) AS snapshot_sequence
+                        FROM snapshots
+                        GROUP BY vault_id
+                    ) AS latest
+                    ON latest.vault_id = s.vault_id
+                       AND latest.snapshot_sequence = s.snapshot_sequence;
+                DROP TABLE snapshots;
+                ALTER TABLE snapshots_v19 RENAME TO snapshots;
                 ",
             ),
         ];
@@ -3069,6 +3118,9 @@ impl Db {
         data: &str,
         schema_version: u32,
     ) -> Result<(), rusqlite::Error> {
+        let sequence = i64::try_from(sequence)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let schema_version = i64::from(schema_version);
         let conn = self.conn.lock().unwrap();
         conn.execute(
             r"
@@ -3077,14 +3129,36 @@ impl Db {
             ",
             rusqlite::params![
                 vault_id,
-                sequence as i64,
+                sequence,
                 event_type,
                 timestamp.to_rfc3339(),
                 data,
-                schema_version as i64
+                schema_version
             ],
         )?;
         Ok(())
+    }
+
+    /// Return the greatest stored sequence for a vault, or zero when it has no events.
+    pub fn get_last_event_sequence(&self, vault_id: &str) -> Result<u64, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let sequence: Option<i64> = conn.query_row(
+            "SELECT MAX(sequence) FROM events WHERE vault_id = ?1",
+            rusqlite::params![vault_id],
+            |row| row.get(0),
+        )?;
+        sequence
+            .map(|sequence| {
+                u64::try_from(sequence).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()
+            .map(|sequence| sequence.unwrap_or(0))
     }
 
     /// Retrieve all events for a vault, ordered by sequence.
@@ -3103,12 +3177,28 @@ impl Db {
         )?;
 
         let events = stmt.query_map(rusqlite::params![vault_id], |row| {
+            let sequence = row.get::<_, i64>(0)?;
+            let sequence = u64::try_from(sequence).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::new(e),
+                )
+            })?;
+            let schema_version = row.get::<_, i64>(4)?;
+            let schema_version = u32::try_from(schema_version).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Integer,
+                    Box::new(e),
+                )
+            })?;
             Ok((
-                row.get::<_, i64>(0)? as u64,
+                sequence,
                 row.get(1)?,
                 row.get(2)?,
                 row.get(3)?,
-                row.get::<_, i64>(4)? as u32,
+                schema_version,
             ))
         })?;
 
@@ -3127,22 +3217,18 @@ impl Db {
         taken_at: &chrono::DateTime<chrono::Utc>,
         state: &str,
     ) -> Result<(), rusqlite::Error> {
+        let snapshot_sequence = i64::try_from(snapshot_sequence)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             r"
             INSERT INTO snapshots (vault_id, snapshot_sequence, taken_at, state)
             VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(vault_id) DO UPDATE SET
-              snapshot_sequence = excluded.snapshot_sequence,
+            ON CONFLICT(vault_id, snapshot_sequence) DO UPDATE SET
               taken_at = excluded.taken_at,
               state = excluded.state
             ",
-            rusqlite::params![
-                vault_id,
-                snapshot_sequence as i64,
-                taken_at.to_rfc3339(),
-                state
-            ],
+            rusqlite::params![vault_id, snapshot_sequence, taken_at.to_rfc3339(), state],
         )?;
         Ok(())
     }
@@ -3158,12 +3244,55 @@ impl Db {
             SELECT snapshot_sequence, taken_at, state
             FROM snapshots
             WHERE vault_id = ?1
+            ORDER BY snapshot_sequence DESC
+            LIMIT 1
             ",
         )?;
 
         stmt.query_row(rusqlite::params![vault_id], |row| {
-            Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?))
+            let snapshot_sequence = row.get::<_, i64>(0)?;
+            let snapshot_sequence = u64::try_from(snapshot_sequence).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::new(e),
+                )
+            })?;
+            Ok((snapshot_sequence, row.get(1)?, row.get(2)?))
         })
+        .optional()
+    }
+
+    /// Retrieve the newest snapshot at or before a sequence boundary.
+    pub fn get_snapshot_at_or_before(
+        &self,
+        vault_id: &str,
+        sequence: u64,
+    ) -> Result<Option<(u64, String, String)>, rusqlite::Error> {
+        let sequence = i64::try_from(sequence)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            r"
+            SELECT snapshot_sequence, taken_at, state
+            FROM snapshots
+            WHERE vault_id = ?1 AND snapshot_sequence <= ?2
+            ORDER BY snapshot_sequence DESC
+            LIMIT 1
+            ",
+            rusqlite::params![vault_id, sequence],
+            |row| {
+                let snapshot_sequence = row.get::<_, i64>(0)?;
+                let snapshot_sequence = u64::try_from(snapshot_sequence).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::new(e),
+                    )
+                })?;
+                Ok((snapshot_sequence, row.get(1)?, row.get(2)?))
+            },
+        )
         .optional()
     }
 
